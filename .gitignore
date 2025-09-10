@@ -1,0 +1,16 @@
+# Python/Backend
+__pycache__/
+.venv/
+*.pyc
+*.env
+
+# Node.js/Frontend
+node_modules/
+.next/
+out/
+npm-debug.log*
+*.log
+
+# IDE & OS specific
+.idea/
+.DS_Store
