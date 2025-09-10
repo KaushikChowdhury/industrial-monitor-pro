@@ -108,6 +108,15 @@ def get_readings(path: str, camera_id: str, since):
     rows = [{"timestamp": r[0], "reading": r[1], "is_anomaly": bool(r[2])} for r in cur.fetchall()]
     conn.close(); return rows
 
+def get_last_reading_row(path: str, camera_id: str):
+    conn = sqlite3.connect(path); cur = conn.cursor()
+    cur.execute("SELECT timestamp, reading FROM dial_readings WHERE camera_id=? ORDER BY timestamp DESC LIMIT 1", (camera_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"timestamp": row[0], "reading": float(row[1])}
+
 
 def get_camera_thresholds(path: str, camera_id: str, default_low: float, default_med: float, default_high: float):
     conn = sqlite3.connect(path); cur = conn.cursor()

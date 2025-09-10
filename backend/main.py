@@ -1,4 +1,5 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
+# backend/main.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -10,6 +11,7 @@ import asyncio
 import base64
 import io
 from typing import List, Optional
+import urllib.request
 
 from dial_cv import DialDetector
 from database import (
@@ -23,11 +25,14 @@ from database import (
     calc_metrics,
     get_camera_thresholds,
     set_camera_thresholds,
+    get_last_reading_row,
 )
 from report import build_daily_report_pdf
+from models import init_models
+from routes import gauges as gauges_routes
 
 DB_PATH = "monitoring.db"
-app = FastAPI(title="Industrial Monitoring API", version="1.1.1")
+app = FastAPI(title="Industrial Monitoring API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -61,6 +66,9 @@ class CalibrateIn(BaseModel):
 @app.on_event("startup")
 async def _startup():
     init_database(DB_PATH)
+    init_models(DB_PATH)
+    
+app.include_router(gauges_routes.router, prefix="/api")
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
@@ -77,7 +85,7 @@ async def ws_endpoint(ws: WebSocket):
                 "metrics": metrics,
                 "anomalies": anomalies,
                 "cameras": cameras,
-                # keep global fallback for legacy UI slider
+                # legacy global threshold for old UI slider
                 "threshold": GLOBAL_THRESHOLD_LOW,
             })
     except WebSocketDisconnect:
@@ -100,10 +108,12 @@ async def set_threshold(payload: ThresholdIn):
 # Per-camera thresholds
 @app.get("/api/camera/{camera_id}/thresholds")
 async def api_get_cam_thresholds(camera_id: str):
-    low, med, high = get_camera_thresholds(DB_PATH, camera_id,
-                                           default_low=GLOBAL_THRESHOLD_LOW,
-                                           default_med=GLOBAL_THRESHOLD_MED,
-                                           default_high=GLOBAL_THRESHOLD_HIGH)
+    low, med, high = get_camera_thresholds(
+        DB_PATH, camera_id,
+        default_low=GLOBAL_THRESHOLD_LOW,
+        default_med=GLOBAL_THRESHOLD_MED,
+        default_high=GLOBAL_THRESHOLD_HIGH
+    )
     return {"camera_id": camera_id, "low": low, "med": med, "high": high}
 
 @app.post("/api/camera/{camera_id}/thresholds")
@@ -120,12 +130,25 @@ async def set_calibration(payload: CalibrateIn):
     return {"ok": True, "calibration": payload.dict()}
 
 @app.post("/api/process_frame")
-async def process_frame(camera_id: str, file: UploadFile = File(...)):
+async def process_frame(camera_id: str, file: UploadFile = File(...), delta_limit: Optional[float] = None):
     data = await file.read()
     arr = np.frombuffer(data, np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return await _process_common(camera_id, frame, delta_limit)
 
-    # Guard: decoding may fail on corrupt uploads
+@app.post("/api/process_image_url")
+async def process_image_url(camera_id: str, url: str, delta_limit: Optional[float] = None):
+    """Process a remote image (CORS‑safe)."""
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = resp.read()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch image: {e}")
+    arr = np.frombuffer(data, np.uint8)
+    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return await _process_common(camera_id, frame, delta_limit)
+
+async def _process_common(camera_id: str, frame: Optional[np.ndarray], delta_limit: Optional[float] = None):
     if frame is None:
         payload = {
             "detected": False,
@@ -142,41 +165,67 @@ async def process_frame(camera_id: str, file: UploadFile = File(...)):
 
     result = detector.detect_dial(frame)
 
-    # Determine thresholds for this camera
-    low_t, med_t, high_t = get_camera_thresholds(DB_PATH, camera_id,
-        default_low=GLOBAL_THRESHOLD_LOW, default_med=GLOBAL_THRESHOLD_MED, default_high=GLOBAL_THRESHOLD_HIGH)
+    # Camera thresholds
+    low_t, med_t, high_t = get_camera_thresholds(
+        DB_PATH, camera_id,
+        default_low=GLOBAL_THRESHOLD_LOW,
+        default_med=GLOBAL_THRESHOLD_MED,
+        default_high=GLOBAL_THRESHOLD_HIGH
+    )
 
     detected = bool(result.get("detected", False))
     reading = float(result.get("reading", 0.0)) if detected else 0.0
 
-    # Status band logic
+    # Status banding
     status = "UNKNOWN"
     is_anom = False
     band_threshold_used: Optional[float] = None
     if detected:
         if reading > high_t:
-            status = "HIGH"; is_anom = True; band_threshold_used = high_t
+            status = "HIGH";   is_anom = True;  band_threshold_used = high_t
         elif reading > med_t:
-            status = "MEDIUM"; is_anom = True; band_threshold_used = med_t
+            status = "MEDIUM"; is_anom = True;  band_threshold_used = med_t
         elif reading > low_t:
-            status = "LOW"; is_anom = True; band_threshold_used = low_t
+            status = "LOW";    is_anom = True;  band_threshold_used = low_t
         else:
             status = "NORMAL"; is_anom = False; band_threshold_used = low_t
+
+    # Movement anomaly: if rate of change exceeds limit
+    movement_flag = False
+    velocity = 0.0
+    try:
+        last = get_last_reading_row(DB_PATH, camera_id)
+        if detected and last and delta_limit is not None:
+            # Parse SQLite timestamp: 'YYYY-MM-DD HH:MM:SS'
+            prev_ts = datetime.strptime(last["timestamp"], "%Y-%m-%d %H:%M:%S")
+            dt = (datetime.now() - prev_ts).total_seconds()
+            if dt > 0:
+                velocity = (reading - float(last["reading"])) / dt
+                if abs(velocity) > float(delta_limit):
+                    movement_flag = True
+                    is_anom = True  # also mark payload
+    except Exception:
+        pass
 
     insert_reading(DB_PATH, camera_id, reading, int(is_anom), float(result.get("confidence", 0.0)), int(detected))
     upsert_camera_status(DB_PATH, camera_id, reading, is_active=1)
     if is_anom:
-        insert_anomaly(DB_PATH, camera_id, reading, float(band_threshold_used or low_t), status)
+        # Insert value-band anomaly first (if any)
+        if band_threshold_used is not None and status in {"LOW", "MEDIUM", "HIGH"}:
+            insert_anomaly(DB_PATH, camera_id, reading, float(band_threshold_used or low_t), status)
+        # Insert movement anomaly separately
+        if movement_flag:
+            insert_anomaly(DB_PATH, camera_id, reading, float(delta_limit or 0.0), "DELTA")
 
-    # Annotate (optional overlay consumers will use this)
+    # Annotate
     annotated = frame.copy()
     if detected and result.get("center"):
         cx, cy = result["center"]
         radius = int(result["radius"])
         cv2.circle(annotated, (int(cx), int(cy)), radius, (0, 255, 0), 2)
         cv2.putText(
-            annotated,
-            f"{reading:.1f}", (int(cx) - 10, int(cy) - radius - 10),
+            annotated, f"{reading:.1f}",
+            (int(cx) - 10, int(cy) - radius - 10),
             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2
         )
     _, buf = cv2.imencode('.jpg', annotated)
@@ -189,10 +238,12 @@ async def process_frame(camera_id: str, file: UploadFile = File(...)):
         "confidence": float(result.get("confidence", 0.0)),
         "annotated_image_b64": b64,
         "is_anomaly": is_anom,
+        "movement_anomaly": movement_flag,
+        "velocity": velocity,
         "thresholds": {"low": low_t, "med": med_t, "high": high_t},
     }
 
-    # Best-effort push to websockets
+    # Best‑effort push to websockets
     for ws in list(active_ws):
         try:
             await ws.send_json({"type": "reading_update", "camera_id": camera_id, **payload})

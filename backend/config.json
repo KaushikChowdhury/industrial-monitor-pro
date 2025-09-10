@@ -1,0 +1,24 @@
+{
+  "models": {
+    "default_backend": "hybrid",
+    "yolo_model": "yolov5s",
+    "vdn_enabled": true,
+    "confidence_threshold": 0.5
+  },
+  "calibration": {
+    "default_min_angle": 0,
+    "default_max_angle": 270,
+    "default_min_value": 0,
+    "default_max_value": 100
+  },
+  "tracking": {
+    "enabled": true,
+    "window_size": 5,
+    "outlier_threshold": 2.0
+  },
+  "few_shot": {
+    "samples_required": 5,
+    "learning_rate": 0.001,
+    "epochs": 10
+  }
+}

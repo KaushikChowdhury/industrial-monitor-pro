@@ -1,12 +1,24 @@
+# Core dependencies (existing)
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 python-multipart==0.0.9
-# Use headless build to avoid system libGL issues on servers/containers
 opencv-python-headless==4.10.0.84
-# Numpy kept flexible to support Python 3.10–3.12 environments
 numpy>=1.26.4
 pydantic==2.7.4
 reportlab==4.2.2
 pandas==2.2.2
 pytest==8.2.0
 httpx==0.27.0
+
+# ML/Deep Learning dependencies
+torch>=2.0.0  # PyTorch for VDN and neural networks
+torchvision>=0.15.0  # Computer vision models
+yolov5>=7.0.0  # YOLO implementation (optional, can use ultralytics)
+# Alternative: ultralytics>=8.0.0  # YOLOv8/v9 support
+
+# Additional utilities
+tqdm>=4.65.0  # Progress bars for downloads
+Pillow>=10.0.0  # Image processing
+scikit-learn>=1.3.0  # ML utilities
+scipy>=1.11.0  # Scientific computing
+matplotlib>=3.7.0  # Visualization (optional)
