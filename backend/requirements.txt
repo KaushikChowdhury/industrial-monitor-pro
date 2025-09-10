@@ -9,6 +9,8 @@ reportlab==4.2.2
 pandas==2.2.2
 pytest==8.2.0
 httpx==0.27.0
+ultralytics>=8.2
+
 
 # ML/Deep Learning dependencies
 torch>=2.0.0  # PyTorch for VDN and neural networks

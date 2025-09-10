@@ -51,57 +51,72 @@ async def startup_event():
 
 @app.post("/api/process_frame")
 async def process_frame(camera_id: str, file: UploadFile = File(...)):
-    if not state.detector: raise HTTPException(status_code=503, detail="ML Detector not initialized.")
+    if not state.detector:
+        raise HTTPException(status_code=503, detail="ML Detector not initialized.")
+    
     data = await file.read()
     arr = np.frombuffer(data, np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if frame is None: return {"detected": False, "reading": 0.0, "annotated_image_b64": ""}
-    
+    if frame is None:
+        return {"detected": False, "reading": 0.0}
+
     ml_readings = state.detector.detect(frame)
     detected = bool(ml_readings)
     reading = ml_readings[0]['value'] if detected else 0.0
     confidence = ml_readings[0]['confidence'] if detected else 0.0
+    
+    gauge_bbox = None
+    pointer_bbox = None
 
-    # --- Database and Status Logic (only if detected) ---
     if detected:
         low_t, med_t, high_t = get_camera_thresholds(DB_PATH, camera_id, default_low=10, default_med=20, default_high=30)
-        status = "UNKNOWN"; is_anom = False; band_threshold_used = None
-        if reading > high_t: status, is_anom, band_threshold_used = "HIGH", True, high_t
-        elif reading > med_t: status, is_anom, band_threshold_used = "MEDIUM", True, med_t
-        elif reading > low_t: status, is_anom, band_threshold_used = "LOW", True, low_t
-        else: status, is_anom, band_threshold_used = "NORMAL", False, low_t
+        status = "UNKNOWN"
+        is_anom = False
+        band_threshold_used = None
+
+        if reading > high_t:
+            status, is_anom, band_threshold_used = "HIGH", True, high_t
+        elif reading > med_t:
+            status, is_anom, band_threshold_used = "MEDIUM", True, med_t
+        elif reading > low_t:
+            status, is_anom, band_threshold_used = "LOW", True, low_t
+        else:
+            status, is_anom, band_threshold_used = "NORMAL", False, low_t
         
         insert_reading(DB_PATH, camera_id, reading, int(is_anom), float(confidence), int(detected))
         upsert_camera_status(DB_PATH, camera_id, reading, is_active=1)
-        if is_anom: insert_anomaly(DB_PATH, camera_id, reading, float(band_threshold_used or low_t), status)
+        if is_anom:
+            insert_anomaly(DB_PATH, camera_id, reading, float(band_threshold_used or low_t), status)
+
+        main_reading = ml_readings[0]
+        if 'bounds' in main_reading:
+            b = main_reading['bounds']
+            gauge_bbox = [b['x'], b['y'], b['x'] + b['w'], b['y'] + b['h']]
+        
+        if 'pointer_bounds' in main_reading:
+            pb = main_reading['pointer_bounds']
+            pointer_bbox = [pb['x'], pb['y'], pb['x'] + pb['w'], pb['y'] + pb['h']]
     else:
-        # If nothing is detected, the status is simply unknown.
         status = "UNKNOWN"
         is_anom = False
         low_t, med_t, high_t = get_camera_thresholds(DB_PATH, camera_id, default_low=10, default_med=20, default_high=30)
 
-    # --- Image Annotation Logic ---
-    # Always create an annotated image, even if no dials are found.
-    annotated = frame.copy()
-    if detected:
-        # If we have readings, draw the bounding boxes on the frame
-        for r in ml_readings:
-            b = r['bounds']
-            cv2.rectangle(annotated, (b['x'], b['y']), (b['x']+b['w'], b['y']+b['h']), (0, 255, 0), 2)
-            cv2.putText(annotated, f"{r['value']:.1f}", (b['x'], b['y'] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    
-    _, buf = cv2.imencode('.jpg', annotated)
-    b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
-
     payload = {
-        "detected": detected, "status": status, "reading": reading,
-        "confidence": float(confidence), "annotated_image_b64": "data:image/jpeg;base64," + b64,
-        "is_anomaly": is_anom, "thresholds": {"low": low_t, "med": med_t, "high": high_t},
+        "detected": detected,
+        "status": status,
+        "reading": reading,
+        "confidence": float(confidence),
+        "is_anomaly": is_anom,
+        "thresholds": {"low": low_t, "med": med_t, "high": high_t},
+        "gauge_bbox": gauge_bbox,
+        "pointer_bbox": pointer_bbox,
     }
     
-    for ws in list(state.active_ws): 
-        try: await ws.send_json({"type": "reading_update", "camera_id": camera_id, **payload})
-        except Exception: pass
+    for ws in list(state.active_ws):
+        try:
+            await ws.send_json({"type": "reading_update", "camera_id": camera_id, **payload})
+        except Exception:
+            pass
     
     return payload
 

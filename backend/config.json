@@ -1,9 +1,12 @@
 {
   "models": {
-    "default_backend": "hybrid",
-    "yolo_model": "yolov5s",
-    "vdn_enabled": true,
-    "confidence_threshold": 0.5
+    "model_path": "models/best_gauge_detector.pt",
+    "confidence_threshold": 0.4,
+    "iou_threshold": 0.5,
+    "class_names": {
+      "0": "dial",
+      "1": "needle"
+    }
   },
   "calibration": {
     "default_min_angle": 0,

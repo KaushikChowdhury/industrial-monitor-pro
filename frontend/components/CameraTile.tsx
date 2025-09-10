@@ -10,23 +10,15 @@ type FrameResp = {
   status: 'UNKNOWN' | 'NORMAL' | 'LOW' | 'MEDIUM' | 'HIGH'
   reading: number
   confidence: number
-  annotated_image_b64: string
   is_anomaly: boolean
   thresholds: CamThresholds
+  gauge_bbox: [number, number, number, number] | null
+  pointer_bbox: [number, number, number, number] | null
 }
-
-const DEMO_URLS = [
-  'https://tse1.mm.bing.net/th/id/OIP.vFkkFDeIN6FrbZpx78rZ2gHaE8?w=474&h=474&c=7&p=0',
-  'https://tse1.mm.bing.net/th/id/OIP.PBA5fyzcbYtB0x44PryliAHaHa?w=474&h=474&c=7&p=0',
-  'https://tse2.mm.bing.net/th/id/OIP.U0OY5NUaEtRy04TlZvOVWAHaHa?w=474&h=474&c=7&p=0',
-  'https://tse3.mm.bing.net/th/id/OIP.YCowa3Npw3ddstrClABxIQHaFb?w=474&h=474&c=7&p=0'
-]
 
 export default function CameraTile({ id, title, onRemove }: { id: string; title: string; onRemove: () => void }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
-  const [mode, setMode] = useState<'webcam'|'image'>('webcam')
-  const [imageUrl, setImageUrl] = useState<string>('')
   const [streaming, setStreaming] = useState(false)
   const [reading, setReading] = useState<number>(0)
   const [prevReading, setPrevReading] = useState<number | null>(null)
@@ -34,7 +26,6 @@ export default function CameraTile({ id, title, onRemove }: { id: string; title:
   const [velocity, setVelocity] = useState<number>(0)
   const [detected, setDetected] = useState(false)
   const [status, setStatus] = useState<FrameResp['status']>('UNKNOWN')
-  const [imageB64, setImageB64] = useState<string | null>(null)
   const [confidence, setConfidence] = useState<number>(0)
   const [thr, setThr] = useState<CamThresholds>({ low: 85, med: 90, high: 95 })
   const [deltaLimit, setDeltaLimit] = useState<number>(12) // value/sec considered fast
@@ -54,17 +45,24 @@ export default function CameraTile({ id, title, onRemove }: { id: string; title:
   // Webcam loop → send frames
   useEffect(() => {
     let timer: any
-    if (streaming && mode === 'webcam') {
+    if (streaming) {
       timer = setInterval(async () => {
         const canvas = canvasRef.current
         const video = videoRef.current
-        if (!canvas || !video) return
-        if (video.readyState < 2) return
-        const ctx = canvas.getContext('2d')!
+        if (!canvas || !video || video.readyState < 2) return
+
+        // Ensure canvas dimensions match video
         canvas.width = video.videoWidth
         canvas.height = video.videoHeight
-        ctx.drawImage(video, 0, 0)
-        canvas.toBlob(async (blob) => {
+        
+        // Draw video to a temporary canvas to create a blob
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = video.videoWidth;
+        tempCanvas.height = video.videoHeight;
+        const tempCtx = tempCanvas.getContext('2d')!;
+        tempCtx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+
+        tempCanvas.toBlob(async (blob) => {
           if (!blob) return
           const form = new FormData()
           form.append('file', blob, 'frame.jpg')
@@ -78,13 +76,12 @@ export default function CameraTile({ id, title, onRemove }: { id: string; title:
       }, 600)
     }
     return () => clearInterval(timer)
-  }, [streaming, id, mode])
+  }, [streaming, id, deltaLimit])
 
   const handleResp = (d: FrameResp) => {
     setDetected(d.detected)
     setStatus(d.status)
     setConfidence(d.confidence)
-    setImageB64(d.annotated_image_b64)
     setThr(d.thresholds)
 
     const now = performance.now()
@@ -96,12 +93,36 @@ export default function CameraTile({ id, title, onRemove }: { id: string; title:
     setPrevReading(d.reading)
     setPrevTs(now)
     setReading(d.reading)
+
+    // Drawing logic
+    const canvas = canvasRef.current;
+    const video = videoRef.current;
+    if (!canvas || !video || video.readyState < 2) return;
+
+    const ctx = canvas.getContext('2d')!;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    if (d.gauge_bbox) {
+        ctx.strokeStyle = "#00FF00";
+        ctx.lineWidth = 2;
+        const [x0, y0, x1, y1] = d.gauge_bbox;
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+        ctx.fillStyle = "#00FF00";
+        ctx.font = "16px sans-serif";
+        ctx.fillText(d.reading.toFixed(1), x0, y0 - 5);
+    }
+    if (d.pointer_bbox) {
+        ctx.strokeStyle = "#FFEB3B";
+        ctx.lineWidth = 2;
+        const [x0, y0, x1, y1] = d.pointer_bbox;
+        ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+    }
   }
 
   const startWebcam = async () => {
     try {
       const media = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
-      if (videoRef.current) { videoRef.current.srcObject = media; setStreaming(true); setMode('webcam') }
+      if (videoRef.current) { videoRef.current.srcObject = media; setStreaming(true); }
     } catch (e) { alert('Unable to access camera: ' + (e as any).message) }
   }
 
@@ -122,15 +143,6 @@ export default function CameraTile({ id, title, onRemove }: { id: string; title:
     setThr({ low, med, high })
   }
 
-  const loadImageViaServer = async (url: string) => {
-    setMode('image')
-    setImageUrl(url)
-    try {
-      const res = await axios.post<FrameResp>(`${API}/api/process_image_url?camera_id=${id}&delta_limit=${encodeURIComponent(String(deltaLimit))}&url=${encodeURIComponent(url)}`)
-      handleResp(res.data)
-    } catch (e) { alert('Failed to process image URL.'); console.error(e) }
-  }
-
   const badgeClass = status === 'UNKNOWN' ? 'badge-unknown'
     : (status === 'NORMAL' ? 'badge-ok' : (status === 'LOW' ? 'badge-warn' : 'badge-crit'))
   const velLabel = `${velocity>=0?'+':''}${velocity.toFixed(1)}/s`
@@ -148,10 +160,7 @@ export default function CameraTile({ id, title, onRemove }: { id: string; title:
                  onChange={(e)=>setDeltaLimit(Number(e.target.value)||0)} title="Delta limit (value/sec)" />
           <span className="text-xs text-slate-400">Δ-limit</span>
           {!streaming ? (
-            <>
-              <button className="btn btn-primary" onClick={startWebcam}>Start Webcam</button>
-              <button className="btn" onClick={()=>setMode('image')}>Image Mode</button>
-            </>
+            <button className="btn btn-primary" onClick={startWebcam}>Start Webcam</button>
           ) : (
             <button className="btn" onClick={stopWebcam}>Stop</button>
           )}
@@ -159,25 +168,10 @@ export default function CameraTile({ id, title, onRemove }: { id: string; title:
         </div>
       </div>
 
-      <div className="relative">
-        <video ref={videoRef} autoPlay playsInline className="w-full rounded-xl"
-               style={{display: mode==='webcam'?'block':'none'}} />
-        <canvas ref={canvasRef} className="hidden" />
-        {imageB64 && (
-          <img src={`data:image/jpeg;base64,${imageB64}`} className="overlay-img" alt="annotated overlay" />
-        )}
+      <div className="relative bg-black rounded-xl">
+        <video ref={videoRef} autoPlay playsInline className="hidden" />
+        <canvas ref={canvasRef} className="w-full rounded-xl" />
       </div>
-
-      {mode==='image' && (
-        <div className="flex items-center gap-2">
-          <input className="input flex-1" placeholder="Paste dial image URL"
-                 value={imageUrl} onChange={(e)=>setImageUrl(e.target.value)} />
-          <button className="btn" onClick={()=>imageUrl && loadImageViaServer(imageUrl)}>Load URL</button>
-          {DEMO_URLS.map((u,i)=> (
-            <button key={i} className="btn" onClick={()=>loadImageViaServer(u)}>Demo {i+1}</button>
-          ))}
-        </div>
-      )}
 
       <div className="grid grid-cols-5 gap-3 text-center">
         <div className="card p-3">
